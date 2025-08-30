@@ -1,0 +1,219 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: mailhero-db
+    environment:
+      POSTGRES_DB: mailhero
+      POSTGRES_USER: mailhero
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailhero"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Postfix SMTP Server
+  postfix:
+    image: mailhero/postfix:latest
+    container_name: mailhero-smtp
+    build:
+      context: ./mail-stack/postfix
+      dockerfile: Dockerfile
+    environment:
+      - DOMAIN=mailhero.in
+      - HOSTNAME=mail.mailhero.in
+    volumes:
+      - ./mail-stack/postfix/main.cf:/etc/postfix/main.cf
+      - ./mail-stack/postfix/master.cf:/etc/postfix/master.cf
+      - ./secrets/dkim:/etc/postfix/dkim
+      - mail_queue:/var/spool/postfix
+    ports:
+      - "25:25"
+      - "587:587"
+      - "465:465"
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD", "postfix", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dovecot IMAP Server
+  dovecot:
+    image: mailhero/dovecot:latest
+    container_name: mailhero-imap
+    build:
+      context: ./mail-stack/dovecot
+      dockerfile: Dockerfile
+    environment:
+      - DOMAIN=mailhero.in
+    volumes:
+      - ./mail-stack/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf
+      - ./mail-stack/dovecot/conf.d:/etc/dovecot/conf.d
+      - mail_storage:/var/mail
+      - ./secrets/ssl:/etc/ssl/certs
+    ports:
+      - "993:993"
+      - "995:995"
+      - "143:143"
+      - "110:110"
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD", "doveadm", "who"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Rspamd Anti-spam
+  rspamd:
+    image: rspamd/rspamd:latest
+    container_name: mailhero-rspamd
+    volumes:
+      - ./mail-stack/rspamd:/etc/rspamd/local.d
+      - rspamd_data:/var/lib/rspamd
+    ports:
+      - "11334:11334"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11334/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Bhindi Agent
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: mailhero-agent
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_URL=postgresql://mailhero:${DB_PASSWORD}@postgres:5432/mailhero
+      - SMTP_HOST=postfix
+      - SMTP_PORT=587
+      - IMAP_HOST=dovecot
+      - IMAP_PORT=993
+      - JWT_SECRET=${JWT_SECRET}
+      - DKIM_SELECTOR=s1
+      - DKIM_PRIVATE_KEY_PATH=/secrets/dkim_s1.pem
+    volumes:
+      - ./secrets:/secrets:ro
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - postfix
+      - dovecot
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Webmail UI
+  webmail:
+    build:
+      context: ./webmail
+      dockerfile: Dockerfile
+    container_name: mailhero-webmail
+    environment:
+      - REACT_APP_AGENT_URL=http://agent:3001
+    ports:
+      - "3000:80"
+    depends_on:
+      - agent
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Admin Console
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    container_name: mailhero-admin
+    environment:
+      - REACT_APP_AGENT_URL=http://agent:3001
+    ports:
+      - "3002:80"
+    depends_on:
+      - agent
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mailhero-proxy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./secrets/ssl:/etc/ssl/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - webmail
+      - admin
+      - agent
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mailhero-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mailhero-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3003:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  mail_storage:
+  mail_queue:
+  rspamd_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: mailhero-network
